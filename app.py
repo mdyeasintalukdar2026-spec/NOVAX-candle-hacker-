@@ -2,7 +2,6 @@ from flask import Flask, jsonify, make_response, request
 import requests
 import time
 import os
-import math
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -58,12 +57,6 @@ BACKUP_APIS = [
         for n in range(11, 61)
     ], start=1)
 ]
-
-# 550+ Ultra Pro Max Confluence Rules & 12M Knowledge Matrix
-ULTRA_KNOWLEDGE_CONFIG = {
-    "confluence_rules": 556,
-    "knowledge_corpus": "12,000,000+ Real OHLCV & Tick Microstructure Patterns",
-}
 
 STATE_LOCK = threading.Lock()
 RECENT_SIGNALS = []
@@ -129,20 +122,21 @@ class LiveMarketCandleEngine:
         return True
 
     @staticmethod
-    def _select_bidirectional_signal(call_weight: float, put_weight: float, default_seed: int) -> str:
+    def _balance_bidirectional(call_score: float, put_score: float):
         with STATE_LOCK:
-            # Prevent one-sided streak bias (একমুখী সিগন্যাল রোধ)
             if len(RECENT_SIGNALS) >= 3 and len(set(RECENT_SIGNALS[-3:])) == 1:
-                last_dir = RECENT_SIGNALS[-1]
-                if last_dir == "CALL":
-                    call_weight *= 0.55
+                streak_dir = RECENT_SIGNALS[-1]
+                if streak_dir == "CALL":
+                    call_score *= 0.55
                 else:
-                    put_weight *= 0.55
+                    put_score *= 0.55
 
-            if abs(call_weight - put_weight) < 1e-6:
-                chosen = "CALL" if (default_seed % 2 == 0) else "PUT"
+            if call_score > put_score and call_score >= 5.0:
+                chosen = "CALL"
+            elif put_score > call_score and put_score >= 5.0:
+                chosen = "PUT"
             else:
-                chosen = "CALL" if call_weight > put_weight else "PUT"
+                return None
 
             RECENT_SIGNALS.append(chosen)
             if len(RECENT_SIGNALS) > 20:
@@ -150,7 +144,7 @@ class LiveMarketCandleEngine:
             return chosen
 
     @staticmethod
-    def compute_live_market_signal(symbol: str = "EURUSD") -> dict:
+    def fetch_closes(symbol: str):
         formatted_sym = symbol if "/" in symbol else f"{symbol[:3]}/{symbol[3:]}"
         td_keys = [
             MASTER_APIS["04_TWELVE_DATA_PRO"],
@@ -158,7 +152,7 @@ class LiveMarketCandleEngine:
             BACKUP_APIS[2]["key"],
         ]
 
-        # 1. Multi-Key Time Series Confluence (556 Rules + 12M Pattern Evaluation)
+        # Try Twelve Data live 1min series
         for key in td_keys:
             try:
                 url_ts = f"https://api.twelvedata.com/time_series?symbol={formatted_sym}&interval=1min&outputsize=25&apikey={key}"
@@ -166,100 +160,103 @@ class LiveMarketCandleEngine:
                 if resp.status_code == 200:
                     payload = resp.json()
                     values = payload.get("values", [])
-                    if len(values) >= 2:
+                    if len(values) >= 5:
                         ordered = list(reversed(values))
                         closes = [float(v["close"]) for v in ordered if v.get("close") is not None]
-                        if len(closes) >= 2:
-                            c0 = closes[-1]
-                            c1 = closes[-2]
-                            delta = c0 - c1
-                            prev_delta = (closes[-2] - closes[-3]) if len(closes) >= 3 else delta
-
-                            ema8 = calc_ema(closes, 8)
-                            ema21 = calc_ema(closes, 21)
-                            rsi14 = calc_rsi(closes, 14)
-
-                            call_score = 10.0
-                            put_score = 10.0
-
-                            if ema8 > ema21:
-                                call_score += 2.5
-                            elif ema8 < ema21:
-                                put_score += 2.5
-
-                            if rsi14 < 35:
-                                call_score += 3.0
-                            elif rsi14 > 65:
-                                put_score += 3.0
-
-                            if abs(delta) < 1e-9:
-                                call_score += 1.0 if int(time.time()) % 2 == 0 else 0.0
-                                put_score += 1.0 if int(time.time()) % 2 == 1 else 0.0
-                            elif delta > 0 and prev_delta > 0 and abs(delta) < abs(prev_delta) * 0.65:
-                                put_score += 3.5
-                            elif delta < 0 and prev_delta < 0 and abs(delta) < abs(prev_delta) * 0.65:
-                                call_score += 3.5
-                            elif delta > 0:
-                                call_score += 3.0
-                            else:
-                                put_score += 3.0
-
-                            sig = LiveMarketCandleEngine._select_bidirectional_signal(
-                                call_score, put_score, int(time.time())
-                            )
-                            pip_factor = 100000.0 if ("JPY" not in symbol and "XAU" not in symbol) else 100.0
-                            live_pips = abs(delta) * pip_factor
-                            pts_val = max(8, min(40, int(round(8 + (live_pips * 2.4)))))
-
-                            return {
-                                "signal": sig,
-                                "trend": "BULLISH (UP)" if sig == "CALL" else "BEARISH (DOWN)",
-                                "pts": pts_val,
-                                "live_price": c0,
-                                "rule": f"556-Rule Live Sync ({formatted_sym}: {c0} | RSI {rsi14:.1f})"
-                            }
+                        if len(closes) >= 5 and len(set(closes[-6:])) > 1:
+                            return closes, formatted_sym, "TWELVE_DATA_LIVE"
             except Exception as e:
                 logger.warning(f"Time series fetch notice for {formatted_sym}: {e}")
 
-        # 2. Live Price Tick Fallback across Master + Backup Twelve Data Keys
-        for key in td_keys:
-            try:
-                url_q = f"https://api.twelvedata.com/price?symbol={formatted_sym}&apikey={key}"
-                q_resp = requests.get(url_q, timeout=2.5)
-                if q_resp.status_code == 200:
-                    price_str = q_resp.json().get("price")
-                    if price_str:
-                        px = float(price_str)
-                        micro_delta = (px * 100000.0) % 1.0
-                        call_w = 10.0 + (micro_delta * 4.0)
-                        put_w = 10.0 + ((1.0 - micro_delta) * 4.0)
-                        sig = LiveMarketCandleEngine._select_bidirectional_signal(
-                            call_w, put_w, int(px * 100000)
-                        )
-                        pts_val = max(8, min(40, int(round(10 + (abs(micro_delta - 0.5) * 60)))))
-                        return {
-                            "signal": sig,
-                            "trend": "BULLISH (UP)" if sig == "CALL" else "BEARISH (DOWN)",
-                            "pts": pts_val,
-                            "live_price": px,
-                            "rule": f"Live Tick Sync ({formatted_sym}: {px})"
-                        }
-            except Exception:
-                continue
+        # Try Binance spot 1m klines if crypto pair
+        clean_pair = symbol.replace("/", "").replace("-", "").upper()
+        if clean_pair.endswith("USDT") or clean_pair in {"BTCUSD", "ETHUSD", "SOLUSD", "BNBUSD"}:
+            b_sym = clean_pair if clean_pair.endswith("USDT") else clean_pair.replace("USD", "USDT")
+            for b_url in [BACKUP_APIS[7]["url"], BACKUP_APIS[8]["url"]]:
+                try:
+                    b_resp = requests.get(b_url, params={"symbol": b_sym, "interval": "1m", "limit": 25}, timeout=3.0)
+                    if b_resp.status_code == 200 and isinstance(b_resp.json(), list) and len(b_resp.json()) >= 5:
+                        closes = [float(row[4]) for row in b_resp.json()]
+                        if len(set(closes[-6:])) > 1:
+                            return closes, b_sym, "BINANCE_LIVE"
+                except Exception:
+                    continue
 
-        # 3. Bidirectional Live Tick Stream Fallback
-        tick_sec = int(time.time())
-        sig = LiveMarketCandleEngine._select_bidirectional_signal(
-            12.0 if (tick_sec % 2 == 0) else 8.0,
-            12.0 if (tick_sec % 2 == 1) else 8.0,
-            tick_sec
-        )
-        pts_val = 8 + ((tick_sec * 7) % 33)
+        return [], formatted_sym, "NO_LIVE_FEED"
+
+    @staticmethod
+    def compute_live_market_signal(symbol: str = "EURUSD") -> dict:
+        closes, formatted_sym, source = LiveMarketCandleEngine.fetch_closes(symbol)
+        if not closes:
+            return {
+                "signal": "HOLD",
+                "trend": "NO LIVE FEED",
+                "status": "NO_LIVE_DATA",
+                "pts": 0,
+                "rule": f"Live feed unavailable for {formatted_sym} — fake signal blocked."
+            }
+
+        c0 = closes[-1]
+        c1 = closes[-2]
+        delta = c0 - c1
+        prev_delta = c1 - closes[-3]
+
+        if abs(delta) < 1e-12:
+            return {
+                "signal": "HOLD",
+                "trend": "FLAT CANDLE",
+                "status": "NO_MOVE",
+                "pts": 0,
+                "rule": f"Zero price delta on {formatted_sym} — entry skipped."
+            }
+
+        ema8 = calc_ema(closes, 8)
+        ema21 = calc_ema(closes, 21)
+        rsi14 = calc_rsi(closes, 14)
+
+        call_score = 0.0
+        put_score = 0.0
+
+        if ema8 > ema21:
+            call_score += 3.0
+        elif ema8 < ema21:
+            put_score += 3.0
+
+        if rsi14 <= 33.0:
+            call_score += 4.0
+        elif rsi14 >= 67.0:
+            put_score += 4.0
+
+        if delta > 0 and prev_delta > 0 and abs(delta) < abs(prev_delta) * 0.65:
+            put_score += 4.0
+        elif delta < 0 and prev_delta < 0 and abs(delta) < abs(prev_delta) * 0.65:
+            call_score += 4.0
+        elif delta > 0:
+            call_score += 3.5
+        else:
+            put_score += 3.5
+
+        sig = LiveMarketCandleEngine._balance_bidirectional(call_score, put_score)
+        if not sig:
+            return {
+                "signal": "HOLD",
+                "trend": "LOW CONFLUENCE",
+                "status": "FILTERED",
+                "pts": 0,
+                "rule": f"Confluence below threshold on {formatted_sym} — random signal blocked."
+            }
+
+        pip_factor = 100000.0 if ("JPY" not in symbol and "XAU" not in symbol) else 100.0
+        live_pips = abs(delta) * pip_factor
+        pts_val = max(8, min(40, int(round(8 + (live_pips * 2.4)))))
+
         return {
             "signal": sig,
             "trend": "BULLISH (UP)" if sig == "CALL" else "BEARISH (DOWN)",
+            "status": "GREEN_EXECUTE",
             "pts": pts_val,
-            "rule": "Bi-Directional Live Tick Stream"
+            "live_price": c0,
+            "rule": f"{source} ({formatted_sym}: {c0} | RSI {rsi14:.1f})"
         }
 
 
@@ -297,26 +294,20 @@ def get_signal():
         res = jsonify({
             "signal": analysis["signal"],
             "trend": analysis["trend"],
-            "status": "GREEN_EXECUTE",
-            "pts": analysis.get("pts", 18),
+            "status": analysis.get("status", "GREEN_EXECUTE"),
+            "pts": analysis.get("pts", 0),
             "rule": analysis["rule"]
         })
         res.headers.add("Access-Control-Allow-Origin", "*")
         return res
     except Exception as e:
         logger.error(f"Signal Error: {e}")
-        sec_now = int(time.time())
-        fallback_sig = LiveMarketCandleEngine._select_bidirectional_signal(
-            12.0 if (sec_now % 2 == 0) else 8.0,
-            12.0 if (sec_now % 2 == 1) else 8.0,
-            sec_now
-        )
         res = jsonify({
-            "signal": fallback_sig,
-            "trend": "BULLISH (UP)" if fallback_sig == "CALL" else "BEARISH (DOWN)",
-            "status": "GREEN_EXECUTE",
-            "pts": 8 + ((sec_now * 5) % 33),
-            "rule": "Live Bi-Directional Confluence Sync."
+            "signal": "HOLD",
+            "trend": "FEED GUARD",
+            "status": "SAFE_HOLD",
+            "pts": 0,
+            "rule": "Live feed guard active — fake signal blocked."
         })
         res.headers.add("Access-Control-Allow-Origin", "*")
         return res
@@ -350,8 +341,8 @@ def bot_script():
 
             var renderServerUrl = "https://novax-candle-hacker.onrender.com";
             var botDisplayName = "NOVAX CANDLE HACKER";
-            var botAvatarUrl = "https://i.postimg.cc/Fz3xjQGZ/file-000000001cc082119080b22d35ecbaaa.png";
-            var communityAvatarUrl = "https://i.postimg.cc/k5NBY37k/file-0000000016a482119619e0cb99151c28.png";
+            var botAvatarUrl = "https://i.postimg.cc/gj79MBwp/IMG-20261120-172626-116.jpg";
+            var communityAvatarUrl = "https://i.postimg.cc/wBR1FS7v/IMG-20261120-161859-259.jpg";
             var telegramChannelName = "👑 PRIME ELITE TRADERS 💎🔥";
             var telegramChannelUrl = "https://t.me/primontop";
             var validAccessKey = "Novaxvipbot5555";
@@ -476,10 +467,6 @@ def bot_script():
                 '  0%   { border-color: #00f0ff; box-shadow: 0 0 18px rgba(0,240,255,0.95), 0 0 30px rgba(74,222,128,0.75); }' +
                 '  50%  { border-color: #e879f9; box-shadow: 0 0 22px rgba(232,121,249,0.98), 0 0 34px rgba(250,204,21,0.78); }' +
                 '  100% { border-color: #00f0ff; box-shadow: 0 0 18px rgba(0,240,255,0.95), 0 0 30px rgba(74,222,128,0.75); }' +
-                '}' +
-                '@keyframes raGlowPulseBright {' +
-                '  0%, 100% { opacity: 0.9; filter: brightness(1.06); }' +
-                '  50%      { opacity: 1; filter: brightness(1.3); }' +
                 '}' +
                 '@keyframes raPopupGreenGlow {' +
                 '  0%, 100% { border-color: #4ade80; box-shadow: 0 0 36px rgba(34,197,94,1), 0 0 68px rgba(74,222,128,0.85); }' +
@@ -827,12 +814,7 @@ def bot_script():
             function computeTradeCandleSize(ptsRaw, isCall, marketStr) {
                 var ptsNum = parseInt(ptsRaw, 10);
                 if(isNaN(ptsNum) || ptsNum <= 0) {
-                    var secNow = Math.floor(Date.now() / 1000);
-                    var mSum = 0;
-                    for(var k = 0; k < marketStr.length; k++) {
-                        mSum += marketStr.charCodeAt(k);
-                    }
-                    ptsNum = 8 + ((secNow + mSum + (isCall ? 3 : 9)) % 33);
+                    ptsNum = 16;
                 }
                 var clampedPts = Math.max(8, Math.min(40, ptsNum));
                 var ratio = (clampedPts - 8) / 32;
@@ -862,7 +844,7 @@ def bot_script():
                 };
             }
 
-            function showBoxSignalCard(isCall, marketDisplayName, ptsFromBackend) {
+            function showBoxSignalCard(isCall, marketDisplayName, ptsFromBackend, customRuleText) {
                 var old = d.getElementById('ra-hacker-signal-popup');
                 if(old) old.remove();
 
@@ -910,7 +892,7 @@ def bot_script():
                     '  <div style="font-size:' + metrics.sizeFontPx + 'px;font-weight:900;color:' + mainColor + ';margin-top:3px;letter-spacing:0.25px;">SIZE: ' + metrics.sizeTag + ' (' + metrics.heightPx + 'PX)</div>' +
                     '  <div style="font-size:6.6px;font-weight:900;color:#ffffff;margin-top:3px;letter-spacing:0.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + liveMarket + '</div>' +
                     '</div>' +
-                    '<div style="text-align:center;font-size:6.5px;font-weight:900;color:' + mainColor + ';letter-spacing:0.8px;border-top:1px dashed rgba(255,255,255,0.22);padding-top:3px;">LOCKED</div>';
+                    '<div style="text-align:center;font-size:6px;font-weight:800;color:' + mainColor + ';letter-spacing:0.4px;border-top:1px dashed rgba(255,255,255,0.22);padding-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + (customRuleText || 'LOCKED') + '</div>';
 
                 d.body.appendChild(popup);
                 var botBtn = d.getElementById('ra-hacker-btn');
@@ -937,7 +919,6 @@ def bot_script():
 
                 var liveMarketDisplay = detectExactQuotexMarket();
                 var cleanSymbol = liveMarketDisplay.replace(/[^A-Z]/g, '').substring(0, 8) || "EURUSD";
-                var initialIsCall = (Math.floor(Date.now() / 1000) % 2 === 0);
 
                 var hexStreamLines = [
                     { text: "MOD KERNEL32.DLL: 0x0550D120 SCOPE", color: "#00f0ff" },
@@ -1060,7 +1041,7 @@ def bot_script():
                     '<div id="ra-terminal-feed" style="background:#02090e;border:1.4px solid #e879f9;border-radius:8px;padding:5px 7px;font-size:7px;line-height:1.42;height:80px;overflow-y:auto;"></div>';
 
                 d.body.appendChild(modal);
-                applyHeroCandleColor(initialIsCall);
+                applyHeroCandleColor(true);
 
                 modal.querySelector('#ra-modal-close').onclick = function() {
                     if(window.__raScanRaf) {
@@ -1093,15 +1074,16 @@ def bot_script():
                 var signalPromise = fetch(renderServerUrl + '/signal?market=' + encodeURIComponent(cleanSymbol) + '&t=' + Date.now())
                     .then(function(r){ return r.json(); })
                     .catch(function(){
-                        var sNow = Math.floor(Date.now() / 1000);
-                        var fb = (sNow % 2 === 0) ? "CALL" : "PUT";
-                        return { signal: fb, pts: 8 + ((sNow * 7) % 33) };
+                        return { signal: "HOLD", pts: 0, rule: "Server feed unreachable — fake signal blocked." };
                     });
 
                 signalPromise.then(function(data){
-                    var sig = String(data.signal || 'CALL').toUpperCase();
-                    var isCall = (sig === 'CALL' || sig === 'UP' || sig === 'BUY');
-                    applyHeroCandleColor(isCall);
+                    var sig = String(data.signal || 'HOLD').toUpperCase();
+                    if(sig === 'CALL' || sig === 'UP' || sig === 'BUY') {
+                        applyHeroCandleColor(true);
+                    } else if(sig === 'PUT' || sig === 'DOWN' || sig === 'SELL') {
+                        applyHeroCandleColor(false);
+                    }
                 });
 
                 var trackWidth = (barsRtlEl && barsRtlEl.clientWidth) ? barsRtlEl.clientWidth : 230;
@@ -1127,7 +1109,7 @@ def bot_script():
                 }
 
                 var scanStartTime = performance.now();
-                var scanDurationMs = 6400;
+                var scanDurationMs = 5200;
                 var finishedScan = false;
 
                 function smoothScanFrame(nowTs) {
@@ -1216,16 +1198,33 @@ def bot_script():
                         if(pctBadge) pctBadge.innerText = '100%';
                         var finalMarket = detectExactQuotexMarket();
                         signalPromise.then(function(data){
-                            var sig = String(data.signal || 'CALL').toUpperCase();
-                            var isCall = (sig === 'CALL' || sig === 'UP' || sig === 'BUY');
-                            var ptsVal = data.pts;
-                            applyHeroCandleColor(isCall);
-                            playTradePongSound(isCall);
-                            setTimeout(function(){
-                                if(modal.isConnected) modal.remove();
-                                setBrokerBackgroundBlur(false);
-                                showBoxSignalCard(isCall, finalMarket, ptsVal);
-                            }, 160);
+                            var sig = String(data.signal || 'HOLD').toUpperCase();
+                            var ptsVal = parseInt(data.pts, 10) || 0;
+                            var ruleTxt = data.rule || 'LIVE SYNC';
+
+                            if(sig === 'CALL' || sig === 'UP' || sig === 'BUY') {
+                                applyHeroCandleColor(true);
+                                playTradePongSound(true);
+                                setTimeout(function(){
+                                    if(modal.isConnected) modal.remove();
+                                    setBrokerBackgroundBlur(false);
+                                    showBoxSignalCard(true, finalMarket, ptsVal, ruleTxt);
+                                }, 140);
+                            } else if(sig === 'PUT' || sig === 'DOWN' || sig === 'SELL') {
+                                applyHeroCandleColor(false);
+                                playTradePongSound(false);
+                                setTimeout(function(){
+                                    if(modal.isConnected) modal.remove();
+                                    setBrokerBackgroundBlur(false);
+                                    showBoxSignalCard(false, finalMarket, ptsVal, ruleTxt);
+                                }, 140);
+                            } else {
+                                setTimeout(function(){
+                                    if(modal.isConnected) modal.remove();
+                                    setBrokerBackgroundBlur(false);
+                                    showBoxSignalCard(true, finalMarket, 8, "HOLD / NO FAKE SIG");
+                                }, 140);
+                            }
                         });
                         return;
                     }
