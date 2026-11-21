@@ -14,6 +14,7 @@ logger = logging.getLogger("NOVAX_CANDLE_HACKER_Engine")
 # SERVER & BRAND METADATA
 # ==============================================================================
 BOT_NAME = "NOVAX CANDLE HACKER"
+BRAND_FOOTER_TAG = "NOVEX TRADER"
 TELEGRAM_CHANNEL_NAME = "👑 PRIME ELITE TRADERS 💎🔥"
 TELEGRAM_CHANNEL_LINK = "https://t.me/primontop"
 RENDER_SERVER_URL = os.environ.get("RENDER_SERVER_URL", "https://novax-candle-hacker.onrender.com").rstrip("/")
@@ -58,7 +59,7 @@ BACKUP_APIS = [
         ("FINNHUB_ALT_2", os.environ.get("FINNHUB_ALT_2", "dbqbhm1r01qn88eevh60dbqbhm1r01qn88eevh6g"), "https://finnhub.io/api/v1/calendar/economic"),
         ("GEMINI_ALT_1", os.environ.get("GEMINI_ALT_1", "AQ.Ab8RN6KAkgWImt-jXgH5LzmL1SM9rsZNShMcceP2C72IUp9eiw"), "https://generativelanguage.googleapis.com/v1beta/models"),
         ("ALPHA_ALT_1", os.environ.get("ALPHA_ALT_1", "KCY7IN9GKW4ARV9P"), "https://www.alphavantage.co/query"),
-        ("BINANCE_SPOT_1", "PUBLIC", "https://api.api.binance.com/api/v3/klines"),
+        ("BINANCE_SPOT_1", "PUBLIC", "https://api.binance.com/api/v3/klines"),
         ("BINANCE_VISION_2", "PUBLIC", "https://data-api.binance.vision/api/v3/klines"),
         ("EXCHANGE_RATE_FREE", "PUBLIC", "https://api.exchangerate-api.com/v4/latest/USD"),
     ] + [
@@ -75,7 +76,7 @@ ULTRA_KNOWLEDGE_CONFIG = {
 }
 
 STATE_LOCK = threading.Lock()
-RECENT_SIGNALS = []
+MARKET_SIGNAL_HISTORY = {}
 
 http_session = requests.Session()
 if DEV_APIS["DEV_04_QX_BRIDGE"]:
@@ -138,37 +139,31 @@ class LiveMarketCandleEngine:
         return True
 
     @staticmethod
-    def _validate_authentic_market_signal(call_score: float, put_score: float, delta: float, is_strong_confluence: bool):
+    def _validate_market_signal(market_key: str, call_score: float, put_score: float, delta: float, is_strong_confluence: bool):
         margin = abs(call_score - put_score)
-        if margin < 0.85 or abs(delta) < 1e-12:
+        if margin < 1.0 or abs(delta) < 1e-12:
             return None
 
         candidate = "CALL" if call_score > put_score else "PUT"
 
         with STATE_LOCK:
-            # Block rhythmic 2-UP / 2-DOWN / 2-UP or 1-UP / 1-DOWN pattern flips unless decisive market breakout exists
-            if len(RECENT_SIGNALS) >= 2:
-                prev1 = RECENT_SIGNALS[-1]
-                prev2 = RECENT_SIGNALS[-2]
-                # Pattern: [X, X] -> if next is Y and then Y again -> [X, X, Y, Y]
-                if len(RECENT_SIGNALS) >= 3:
-                    prev3 = RECENT_SIGNALS[-3]
-                    if prev3 == prev2 and prev1 != prev2 and candidate == prev1 and not is_strong_confluence:
-                        return None
-                # Pattern: [X, Y, X] -> avoid mechanical 1-UP-1-DOWN ping-pong on weak margin
-                if prev3_check := (len(RECENT_SIGNALS) >= 3 and RECENT_SIGNALS[-3] == candidate and RECENT_SIGNALS[-2] != candidate and RECENT_SIGNALS[-1] == RECENT_SIGNALS[-2]):
-                    if margin < 2.4:
-                        return None
-                if len(RECENT_SIGNALS) >= 2 and RECENT_SIGNALS[-2] == candidate and RECENT_SIGNALS[-1] != candidate and margin < 1.8:
-                    return None
+            hist = MARKET_SIGNAL_HISTORY.setdefault(market_key, [])
 
-            # Prevent long one-sided streak (>2 same direction) without strong confluence
-            if len(RECENT_SIGNALS) >= 2 and RECENT_SIGNALS[-1] == RECENT_SIGNALS[-2] == candidate and not is_strong_confluence:
+            # Block one-sided streak (>2 same direction) unless market setup is decisive
+            if len(hist) >= 2 and hist[-1] == hist[-2] == candidate and not is_strong_confluence:
                 return None
 
-            RECENT_SIGNALS.append(candidate)
-            if len(RECENT_SIGNALS) > 24:
-                RECENT_SIGNALS.pop(0)
+            # Block mechanical 2-UP / 2-DOWN alternation without strong confluence
+            if len(hist) >= 3 and hist[-3] == hist[-2] and hist[-1] != hist[-2] and candidate == hist[-1] and not is_strong_confluence:
+                return None
+
+            # Block weak 1-UP / 1-DOWN ping-pong when margin is not clear
+            if len(hist) >= 2 and hist[-2] == candidate and hist[-1] != candidate and margin < 2.0:
+                return None
+
+            hist.append(candidate)
+            if len(hist) > 20:
+                hist.pop(0)
             return candidate
 
     @staticmethod
@@ -184,7 +179,7 @@ class LiveMarketCandleEngine:
             BACKUP_APIS[2]["key"],
         ]
 
-        # 1. Twelve Data real 1min candles
+        # 1. Twelve Data live 1min candles
         for key in td_keys:
             try:
                 url_ts = f"https://api.twelvedata.com/time_series?symbol={formatted_sym}&interval=1min&outputsize=25&apikey={key}"
@@ -204,11 +199,11 @@ class LiveMarketCandleEngine:
                                 candles.append({"o": o_val, "h": h_val, "l": l_val, "c": c_val})
                         closes = [x["c"] for x in candles]
                         if len(closes) >= 4 and len(set(closes[-5:])) > 1:
-                            return candles, formatted_sym, "TWELVE_DATA_LIVE"
+                            return candles, formatted_sym
             except Exception as e:
                 logger.warning(f"Time series fetch notice for {formatted_sym}: {e}")
 
-        # 2. Binance Spot / Vision real 1m klines for crypto/USD pairs
+        # 2. Binance Spot / Vision live 1m klines for crypto/USD pairs
         b_sym = None
         if clean.endswith("USDT"):
             b_sym = clean
@@ -233,22 +228,22 @@ class LiveMarketCandleEngine:
                         ]
                         closes = [x["c"] for x in candles]
                         if len(closes) >= 4 and len(set(closes[-5:])) > 1:
-                            return candles, b_sym, "BINANCE_LIVE"
+                            return candles, b_sym
                 except Exception:
                     continue
 
-        return [], formatted_sym, "NO_LIVE_FEED"
+        return [], formatted_sym
 
     @staticmethod
     def compute_live_market_signal(symbol: str = "EURUSD") -> dict:
-        candles, formatted_sym, source = LiveMarketCandleEngine.fetch_candles(symbol)
+        candles, formatted_sym = LiveMarketCandleEngine.fetch_candles(symbol)
         if not candles:
             return {
                 "signal": "HOLD",
                 "trend": "NO LIVE FEED",
                 "status": "NO_LIVE_DATA",
                 "pts": 0,
-                "rule": f"No live candle feed for {formatted_sym} — fake signal blocked"
+                "rule": BRAND_FOOTER_TAG
             }
 
         closes = [x["c"] for x in candles]
@@ -268,7 +263,7 @@ class LiveMarketCandleEngine:
                 "trend": "FLAT CANDLE",
                 "status": "LOW_HOLD",
                 "pts": 0,
-                "rule": f"Flat movement on {formatted_sym}"
+                "rule": BRAND_FOOTER_TAG
             }
 
         ema8 = calc_ema(closes, 8)
@@ -344,14 +339,14 @@ class LiveMarketCandleEngine:
             or range_pos >= 0.82
         )
 
-        sig = LiveMarketCandleEngine._validate_authentic_market_signal(call_score, put_score, delta, is_strong_confluence)
+        sig = LiveMarketCandleEngine._validate_market_signal(formatted_sym, call_score, put_score, delta, is_strong_confluence)
         if not sig:
             return {
                 "signal": "HOLD",
                 "trend": "MARKET CONDITION GUARD",
                 "status": "LOW_HOLD",
                 "pts": 0,
-                "rule": f"No clear/non-choppy setup on {formatted_sym}"
+                "rule": BRAND_FOOTER_TAG
             }
 
         pip_factor = 100000.0 if ("JPY" not in symbol and "XAU" not in symbol) else 100.0
@@ -364,13 +359,13 @@ class LiveMarketCandleEngine:
             "status": "GREEN_EXECUTE",
             "pts": pts_val,
             "live_price": c0,
-            "rule": f"{source} ({formatted_sym}: {c0} | RSI {rsi14:.1f})"
+            "rule": BRAND_FOOTER_TAG
         }
 
 
 @app.route('/')
 def home():
-    res = make_response(f"{BOT_NAME} ENGINE ACTIVE - ULTRA SMOOTH LIVE CANDLES! | {TELEGRAM_CHANNEL_NAME}")
+    res = make_response(f"{BOT_NAME} ENGINE ACTIVE - {BRAND_FOOTER_TAG} | {TELEGRAM_CHANNEL_NAME}")
     res.headers.add("Access-Control-Allow-Origin", "*")
     return res
 
@@ -394,7 +389,7 @@ def get_signal():
 
         is_news_safe = LiveMarketCandleEngine.check_news_safety(clean_market[:3])
         if not is_news_safe:
-            res = jsonify({"signal": "HOLD", "trend": "NEWS BLOCK", "status": "NEWS_GUARD", "pts": 0, "rule": "High Impact News Filter Active."})
+            res = jsonify({"signal": "HOLD", "trend": "NEWS BLOCK", "status": "NEWS_GUARD", "pts": 0, "rule": BRAND_FOOTER_TAG})
             res.headers.add("Access-Control-Allow-Origin", "*")
             return res
 
@@ -404,7 +399,7 @@ def get_signal():
             "trend": analysis["trend"],
             "status": analysis.get("status", "GREEN_EXECUTE"),
             "pts": analysis.get("pts", 0),
-            "rule": analysis["rule"]
+            "rule": BRAND_FOOTER_TAG
         })
         res.headers.add("Access-Control-Allow-Origin", "*")
         return res
@@ -415,7 +410,7 @@ def get_signal():
             "trend": "FEED GUARD",
             "status": "SAFE_HOLD",
             "pts": 0,
-            "rule": "Live feed guard active"
+            "rule": BRAND_FOOTER_TAG
         })
         res.headers.add("Access-Control-Allow-Origin", "*")
         return res
@@ -449,6 +444,7 @@ def bot_script():
 
             var renderServerUrl = "https://novax-candle-hacker.onrender.com";
             var botDisplayName = "NOVAX CANDLE HACKER";
+            var footerBrandLabel = "NOVEX TRADER";
             var botAvatarUrl = "https://i.postimg.cc/gj79MBwp/IMG-20261120-172626-116.jpg";
             var communityAvatarUrl = "https://i.postimg.cc/wBR1FS7v/IMG-20261120-161859-259.jpg";
             var telegramChannelName = "👑 PRIME ELITE TRADERS 💎🔥";
@@ -878,7 +874,6 @@ def bot_script():
                 d.addEventListener('touchend', onEnd);
             }
 
-            // Auto-detect any active market pair on Quotex (OTC, REAL, Crypto, Commodity, Forex)
             function detectExactQuotexMarket() {
                 try {
                     var selectors = [
@@ -958,7 +953,7 @@ def bot_script():
                 };
             }
 
-            function showHoldGuardCard(marketDisplayName, reasonText) {
+            function showHoldGuardCard(marketDisplayName) {
                 var old = d.getElementById('ra-hacker-signal-popup');
                 if(old) old.remove();
 
@@ -977,10 +972,10 @@ def bot_script():
                     '</div>' +
                     '<div style="background:rgba(2,8,12,0.94);border:1.2px solid #facc15;border-radius:6px;padding:7px 5px;text-align:center;margin-bottom:4px;">' +
                     '  <div style="font-size:6.8px;font-weight:900;color:#fde047;">LIGHT HOLD</div>' +
-                    '  <div style="font-size:5.8px;color:#cbd5e1;margin-top:3px;line-height:1.25;">' + (reasonText || 'Condition guard') + '</div>' +
+                    '  <div style="font-size:5.8px;color:#cbd5e1;margin-top:3px;line-height:1.25;">Condition guard</div>' +
                     '  <div style="font-size:6.6px;font-weight:900;color:#ffffff;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + liveMarket + '</div>' +
                     '</div>' +
-                    '<div style="text-align:center;font-size:6px;font-weight:800;color:#facc15;border-top:1px dashed rgba(250,204,21,0.35);padding-top:3px;">READY NEXT</div>';
+                    '<div style="text-align:center;font-size:6px;font-weight:800;color:#facc15;border-top:1px dashed rgba(250,204,21,0.35);padding-top:3px;">' + footerBrandLabel + '</div>';
 
                 d.body.appendChild(popup);
                 var botBtn = d.getElementById('ra-hacker-btn');
@@ -991,7 +986,7 @@ def bot_script():
                 }, 3500);
             }
 
-            function showBoxSignalCard(isCall, marketDisplayName, ptsFromBackend, customRuleText) {
+            function showBoxSignalCard(isCall, marketDisplayName, ptsFromBackend) {
                 var old = d.getElementById('ra-hacker-signal-popup');
                 if(old) old.remove();
 
@@ -1039,7 +1034,7 @@ def bot_script():
                     '  <div style="font-size:' + metrics.sizeFontPx + 'px;font-weight:900;color:' + mainColor + ';margin-top:3px;letter-spacing:0.25px;">SIZE: ' + metrics.sizeTag + ' (' + metrics.heightPx + 'PX)</div>' +
                     '  <div style="font-size:6.6px;font-weight:900;color:#ffffff;margin-top:3px;letter-spacing:0.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + liveMarket + '</div>' +
                     '</div>' +
-                    '<div style="text-align:center;font-size:6px;font-weight:800;color:' + mainColor + ';letter-spacing:0.4px;border-top:1px dashed rgba(255,255,255,0.22);padding-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + (customRuleText || 'LOCKED') + '</div>';
+                    '<div style="text-align:center;font-size:6.4px;font-weight:900;color:' + mainColor + ';letter-spacing:0.5px;border-top:1px dashed rgba(255,255,255,0.22);padding-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + footerBrandLabel + '</div>';
 
                 d.body.appendChild(popup);
                 var botBtn = d.getElementById('ra-hacker-btn');
@@ -1221,7 +1216,7 @@ def bot_script():
                 var signalPromise = fetch(renderServerUrl + '/signal?market=' + encodeURIComponent(cleanSymbol) + '&t=' + Date.now())
                     .then(function(r){ return r.json(); })
                     .catch(function(){
-                        return { signal: "HOLD", pts: 0, rule: "Feed unreachable" };
+                        return { signal: "HOLD", pts: 0, rule: footerBrandLabel };
                     });
 
                 signalPromise.then(function(data){
@@ -1347,7 +1342,6 @@ def bot_script():
                         signalPromise.then(function(data){
                             var sig = String(data.signal || 'HOLD').toUpperCase();
                             var ptsVal = parseInt(data.pts, 10) || 0;
-                            var ruleTxt = data.rule || 'LIVE SYNC';
 
                             if(sig === 'CALL' || sig === 'UP' || sig === 'BUY') {
                                 applyHeroCandleColor(true);
@@ -1355,7 +1349,7 @@ def bot_script():
                                 setTimeout(function(){
                                     if(modal.isConnected) modal.remove();
                                     setBrokerBackgroundBlur(false);
-                                    showBoxSignalCard(true, finalMarket, ptsVal, ruleTxt);
+                                    showBoxSignalCard(true, finalMarket, ptsVal);
                                 }, 140);
                             } else if(sig === 'PUT' || sig === 'DOWN' || sig === 'SELL') {
                                 applyHeroCandleColor(false);
@@ -1363,13 +1357,13 @@ def bot_script():
                                 setTimeout(function(){
                                     if(modal.isConnected) modal.remove();
                                     setBrokerBackgroundBlur(false);
-                                    showBoxSignalCard(false, finalMarket, ptsVal, ruleTxt);
+                                    showBoxSignalCard(false, finalMarket, ptsVal);
                                 }, 140);
                             } else {
                                 setTimeout(function(){
                                     if(modal.isConnected) modal.remove();
                                     setBrokerBackgroundBlur(false);
-                                    showHoldGuardCard(finalMarket, ruleTxt);
+                                    showHoldGuardCard(finalMarket);
                                 }, 140);
                             }
                         });
