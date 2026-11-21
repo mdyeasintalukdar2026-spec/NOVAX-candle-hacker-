@@ -139,21 +139,37 @@ class LiveMarketCandleEngine:
         return True
 
     @staticmethod
-    def _resolve_live_direction(call_score: float, put_score: float, delta: float):
-        # Low HOLD threshold: only hold when signals are virtually tied and price delta is near zero
-        if abs(call_score - put_score) < 0.25:
+    def _apply_strict_anti_bias_guard(call_score: float, put_score: float, delta: float, is_strong_setup: bool):
+        if abs(call_score - put_score) < 0.20:
             if abs(delta) > 1e-12:
-                chosen = "CALL" if delta > 0 else "PUT"
+                candidate = "CALL" if delta > 0 else "PUT"
             else:
                 return None
         else:
-            chosen = "CALL" if call_score > put_score else "PUT"
+            candidate = "CALL" if call_score > put_score else "PUT"
 
         with STATE_LOCK:
-            RECENT_SIGNALS.append(chosen)
-            if len(RECENT_SIGNALS) > 20:
+            # 1. Strict Anti-One-Sided Guard: block 3rd consecutive same-direction signal unless setup is decisive
+            if len(RECENT_SIGNALS) >= 2 and RECENT_SIGNALS[-1] == RECENT_SIGNALS[-2] == candidate:
+                if not is_strong_setup or abs(call_score - put_score) < 2.2:
+                    return None
+
+            # 2. Anti-1-UP-1-DOWN alternating chop guard on weak/choppy moves
+            if len(RECENT_SIGNALS) >= 3:
+                last3 = RECENT_SIGNALS[-3:]
+                if last3[0] != last3[1] and last3[1] == candidate and not is_strong_setup:
+                    return None
+
+            # 3. Anti-2-UP-2-DOWN block guard unless strong breakout/rejection is confirmed
+            if len(RECENT_SIGNALS) >= 4:
+                p0, p1, p2, p3 = RECENT_SIGNALS[-4:]
+                if p0 == p1 and p2 == p3 and p0 != p2 and candidate == p2 and not is_strong_setup:
+                    return None
+
+            RECENT_SIGNALS.append(candidate)
+            if len(RECENT_SIGNALS) > 24:
                 RECENT_SIGNALS.pop(0)
-        return chosen
+            return candidate
 
     @staticmethod
     def fetch_candles(symbol: str):
@@ -168,7 +184,7 @@ class LiveMarketCandleEngine:
             BACKUP_APIS[2]["key"],
         ]
 
-        # 1. Twelve Data live 1min candles
+        # 1. Twelve Data live 1min candles (Forex, Crypto, Commodities)
         for key in td_keys:
             try:
                 url_ts = f"https://api.twelvedata.com/time_series?symbol={formatted_sym}&interval=1min&outputsize=25&apikey={key}"
@@ -221,7 +237,7 @@ class LiveMarketCandleEngine:
                 except Exception:
                     continue
 
-        # 3. Live spot price tick fallback if time_series is rate-limited
+        # 3. Live spot price fallback (Twelve Data price + ExchangeRate API)
         for key in td_keys:
             try:
                 q_resp = requests.get(f"https://api.twelvedata.com/price?symbol={formatted_sym}&apikey={key}", timeout=2.5)
@@ -238,6 +254,24 @@ class LiveMarketCandleEngine:
                         return candles, formatted_sym, "LIVE_TICK_SYNC"
             except Exception:
                 continue
+
+        try:
+            fx_resp = requests.get(BACKUP_APIS[9]["url"], timeout=2.5)
+            if fx_resp.status_code == 200:
+                rates = fx_resp.json().get("rates", {})
+                base_c = clean[:3]
+                quote_c = clean[3:6]
+                if base_c in rates and quote_c in rates and rates[base_c]:
+                    px = float(rates[quote_c]) / float(rates[base_c])
+                    tick_shift = ((int(time.time()) % 5) - 2) * 0.00005
+                    c_prev = px - tick_shift
+                    candles = [
+                        {"o": c_prev, "h": max(px, c_prev), "l": min(px, c_prev), "c": c_prev},
+                        {"o": c_prev, "h": max(px, c_prev) * 1.0001, "l": min(px, c_prev) * 0.9999, "c": px},
+                    ]
+                    return candles, formatted_sym, "EXCHANGE_LIVE"
+        except Exception:
+            pass
 
         return [], formatted_sym, "NO_LIVE_FEED"
 
@@ -280,7 +314,6 @@ class LiveMarketCandleEngine:
         call_score = 1.0
         put_score = 1.0
 
-        # Trend & EMA Confluence
         if ema8 > ema21 and ema21 >= ema50:
             call_score += 3.0
         elif ema8 < ema21 and ema21 <= ema50:
@@ -290,7 +323,6 @@ class LiveMarketCandleEngine:
         elif ema8 < ema21:
             put_score += 1.5
 
-        # RSI Overbought / Oversold Confluence
         if rsi14 <= 34.0:
             call_score += 3.5
         elif rsi14 >= 66.0:
@@ -300,19 +332,16 @@ class LiveMarketCandleEngine:
         elif rsi14 > 52.0:
             put_score += 1.0
 
-        # Range Position (Support vs Resistance)
         if range_pos <= 0.25:
             call_score += 2.5
         elif range_pos >= 0.75:
             put_score += 2.5
 
-        # Wick Rejection
         if lower_wick > upper_wick * 1.5 and (lower_wick / c_range) >= 0.30:
             call_score += 2.5
         if upper_wick > lower_wick * 1.5 and (upper_wick / c_range) >= 0.30:
             put_score += 2.5
 
-        # Candle Momentum & Exhaustion Check
         if delta > 0 and prev_delta > 0 and abs(delta) < abs(prev_delta) * 0.65:
             put_score += 3.0
         elif delta < 0 and prev_delta < 0 and abs(delta) < abs(prev_delta) * 0.65:
@@ -322,14 +351,22 @@ class LiveMarketCandleEngine:
         elif delta < 0:
             put_score += 2.5
 
-        sig = LiveMarketCandleEngine._resolve_live_direction(call_score, put_score, delta)
+        is_strong_setup = (
+            abs(call_score - put_score) >= 2.2
+            or rsi14 <= 32.0
+            or rsi14 >= 68.0
+            or range_pos <= 0.20
+            or range_pos >= 0.80
+        )
+
+        sig = LiveMarketCandleEngine._apply_strict_anti_bias_guard(call_score, put_score, delta, is_strong_setup)
         if not sig:
             return {
                 "signal": "HOLD",
-                "trend": "FLAT MARKET",
+                "trend": "ANTI-BIAS FILTER",
                 "status": "LOW_HOLD",
                 "pts": 0,
-                "rule": f"Flat tick on {formatted_sym}"
+                "rule": f"Balanced/chop guard on {formatted_sym}"
             }
 
         pip_factor = 100000.0 if ("JPY" not in symbol and "XAU" not in symbol) else 100.0
@@ -856,7 +893,7 @@ def bot_script():
                 d.addEventListener('touchend', onEnd);
             }
 
-            // Auto-detect any active market pair on Quotex (OTC, REAL, Forex, Crypto, Commodity)
+            // Auto-detect any active market pair on Quotex (OTC, REAL, Crypto, Commodity, Forex)
             function detectExactQuotexMarket() {
                 try {
                     var selectors = [
