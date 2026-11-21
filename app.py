@@ -1,6 +1,5 @@
 from flask import Flask, jsonify, make_response, request
 import requests
-import time
 import os
 import threading
 import logging
@@ -139,32 +138,33 @@ class LiveMarketCandleEngine:
         return True
 
     @staticmethod
-    def _apply_strict_anti_bias_guard(call_score: float, put_score: float, delta: float, is_strong_setup: bool):
-        if abs(call_score - put_score) < 0.20:
-            if abs(delta) > 1e-12:
-                candidate = "CALL" if delta > 0 else "PUT"
-            else:
-                return None
-        else:
-            candidate = "CALL" if call_score > put_score else "PUT"
+    def _validate_authentic_market_signal(call_score: float, put_score: float, delta: float, is_strong_confluence: bool):
+        margin = abs(call_score - put_score)
+        if margin < 0.85 or abs(delta) < 1e-12:
+            return None
+
+        candidate = "CALL" if call_score > put_score else "PUT"
 
         with STATE_LOCK:
-            # 1. Strict Anti-One-Sided Guard: block 3rd consecutive same-direction signal unless setup is decisive
-            if len(RECENT_SIGNALS) >= 2 and RECENT_SIGNALS[-1] == RECENT_SIGNALS[-2] == candidate:
-                if not is_strong_setup or abs(call_score - put_score) < 2.2:
+            # Block rhythmic 2-UP / 2-DOWN / 2-UP or 1-UP / 1-DOWN pattern flips unless decisive market breakout exists
+            if len(RECENT_SIGNALS) >= 2:
+                prev1 = RECENT_SIGNALS[-1]
+                prev2 = RECENT_SIGNALS[-2]
+                # Pattern: [X, X] -> if next is Y and then Y again -> [X, X, Y, Y]
+                if len(RECENT_SIGNALS) >= 3:
+                    prev3 = RECENT_SIGNALS[-3]
+                    if prev3 == prev2 and prev1 != prev2 and candidate == prev1 and not is_strong_confluence:
+                        return None
+                # Pattern: [X, Y, X] -> avoid mechanical 1-UP-1-DOWN ping-pong on weak margin
+                if prev3_check := (len(RECENT_SIGNALS) >= 3 and RECENT_SIGNALS[-3] == candidate and RECENT_SIGNALS[-2] != candidate and RECENT_SIGNALS[-1] == RECENT_SIGNALS[-2]):
+                    if margin < 2.4:
+                        return None
+                if len(RECENT_SIGNALS) >= 2 and RECENT_SIGNALS[-2] == candidate and RECENT_SIGNALS[-1] != candidate and margin < 1.8:
                     return None
 
-            # 2. Anti-1-UP-1-DOWN alternating chop guard on weak/choppy moves
-            if len(RECENT_SIGNALS) >= 3:
-                last3 = RECENT_SIGNALS[-3:]
-                if last3[0] != last3[1] and last3[1] == candidate and not is_strong_setup:
-                    return None
-
-            # 3. Anti-2-UP-2-DOWN block guard unless strong breakout/rejection is confirmed
-            if len(RECENT_SIGNALS) >= 4:
-                p0, p1, p2, p3 = RECENT_SIGNALS[-4:]
-                if p0 == p1 and p2 == p3 and p0 != p2 and candidate == p2 and not is_strong_setup:
-                    return None
+            # Prevent long one-sided streak (>2 same direction) without strong confluence
+            if len(RECENT_SIGNALS) >= 2 and RECENT_SIGNALS[-1] == RECENT_SIGNALS[-2] == candidate and not is_strong_confluence:
+                return None
 
             RECENT_SIGNALS.append(candidate)
             if len(RECENT_SIGNALS) > 24:
@@ -184,7 +184,7 @@ class LiveMarketCandleEngine:
             BACKUP_APIS[2]["key"],
         ]
 
-        # 1. Twelve Data live 1min candles (Forex, Crypto, Commodities)
+        # 1. Twelve Data real 1min candles
         for key in td_keys:
             try:
                 url_ts = f"https://api.twelvedata.com/time_series?symbol={formatted_sym}&interval=1min&outputsize=25&apikey={key}"
@@ -192,7 +192,7 @@ class LiveMarketCandleEngine:
                 if resp.status_code == 200:
                     payload = resp.json()
                     values = payload.get("values", [])
-                    if len(values) >= 3:
+                    if len(values) >= 4:
                         ordered = list(reversed(values))
                         candles = []
                         for v in ordered:
@@ -203,12 +203,12 @@ class LiveMarketCandleEngine:
                                 c_val = float(v["close"])
                                 candles.append({"o": o_val, "h": h_val, "l": l_val, "c": c_val})
                         closes = [x["c"] for x in candles]
-                        if len(closes) >= 3 and len(set(closes[-4:])) > 1:
+                        if len(closes) >= 4 and len(set(closes[-5:])) > 1:
                             return candles, formatted_sym, "TWELVE_DATA_LIVE"
             except Exception as e:
                 logger.warning(f"Time series fetch notice for {formatted_sym}: {e}")
 
-        # 2. Binance Spot / Vision live 1m klines for crypto/USD pairs
+        # 2. Binance Spot / Vision real 1m klines for crypto/USD pairs
         b_sym = None
         if clean.endswith("USDT"):
             b_sym = clean
@@ -221,7 +221,7 @@ class LiveMarketCandleEngine:
             for b_url in [BACKUP_APIS[7]["url"], BACKUP_APIS[8]["url"]]:
                 try:
                     b_resp = requests.get(b_url, params={"symbol": b_sym, "interval": "1m", "limit": 25}, timeout=3.0)
-                    if b_resp.status_code == 200 and isinstance(b_resp.json(), list) and len(b_resp.json()) >= 3:
+                    if b_resp.status_code == 200 and isinstance(b_resp.json(), list) and len(b_resp.json()) >= 4:
                         candles = [
                             {
                                 "o": float(row[1]),
@@ -232,46 +232,10 @@ class LiveMarketCandleEngine:
                             for row in b_resp.json()
                         ]
                         closes = [x["c"] for x in candles]
-                        if len(closes) >= 3 and len(set(closes[-4:])) > 1:
+                        if len(closes) >= 4 and len(set(closes[-5:])) > 1:
                             return candles, b_sym, "BINANCE_LIVE"
                 except Exception:
                     continue
-
-        # 3. Live spot price fallback (Twelve Data price + ExchangeRate API)
-        for key in td_keys:
-            try:
-                q_resp = requests.get(f"https://api.twelvedata.com/price?symbol={formatted_sym}&apikey={key}", timeout=2.5)
-                if q_resp.status_code == 200:
-                    px_raw = q_resp.json().get("price")
-                    if px_raw is not None:
-                        px = float(px_raw)
-                        tick_shift = ((int(time.time()) % 7) - 3) * 0.00004
-                        c_prev = px - tick_shift
-                        candles = [
-                            {"o": c_prev, "h": max(px, c_prev), "l": min(px, c_prev), "c": c_prev},
-                            {"o": c_prev, "h": max(px, c_prev) * 1.0001, "l": min(px, c_prev) * 0.9999, "c": px},
-                        ]
-                        return candles, formatted_sym, "LIVE_TICK_SYNC"
-            except Exception:
-                continue
-
-        try:
-            fx_resp = requests.get(BACKUP_APIS[9]["url"], timeout=2.5)
-            if fx_resp.status_code == 200:
-                rates = fx_resp.json().get("rates", {})
-                base_c = clean[:3]
-                quote_c = clean[3:6]
-                if base_c in rates and quote_c in rates and rates[base_c]:
-                    px = float(rates[quote_c]) / float(rates[base_c])
-                    tick_shift = ((int(time.time()) % 5) - 2) * 0.00005
-                    c_prev = px - tick_shift
-                    candles = [
-                        {"o": c_prev, "h": max(px, c_prev), "l": min(px, c_prev), "c": c_prev},
-                        {"o": c_prev, "h": max(px, c_prev) * 1.0001, "l": min(px, c_prev) * 0.9999, "c": px},
-                    ]
-                    return candles, formatted_sym, "EXCHANGE_LIVE"
-        except Exception:
-            pass
 
         return [], formatted_sym, "NO_LIVE_FEED"
 
@@ -284,7 +248,7 @@ class LiveMarketCandleEngine:
                 "trend": "NO LIVE FEED",
                 "status": "NO_LIVE_DATA",
                 "pts": 0,
-                "rule": f"Live feed unavailable for {formatted_sym}"
+                "rule": f"No live candle feed for {formatted_sym} — fake signal blocked"
             }
 
         closes = [x["c"] for x in candles]
@@ -292,10 +256,20 @@ class LiveMarketCandleEngine:
         lows = [x["l"] for x in candles]
 
         last_c = candles[-1]
+        prev_c = candles[-2]
         c0 = last_c["c"]
-        c1 = candles[-2]["c"]
+        c1 = prev_c["c"]
         delta = c0 - c1
         prev_delta = (candles[-2]["c"] - candles[-3]["c"]) if len(candles) >= 3 else delta
+
+        if abs(delta) < 1e-12:
+            return {
+                "signal": "HOLD",
+                "trend": "FLAT CANDLE",
+                "status": "LOW_HOLD",
+                "pts": 0,
+                "rule": f"Flat movement on {formatted_sym}"
+            }
 
         ema8 = calc_ema(closes, 8)
         ema21 = calc_ema(closes, 21)
@@ -308,12 +282,14 @@ class LiveMarketCandleEngine:
         range_pos = (c0 - win_low) / rng
 
         c_range = max(last_c["h"] - last_c["l"], 1e-12)
+        body_size = abs(last_c["c"] - last_c["o"])
         upper_wick = last_c["h"] - max(last_c["o"], last_c["c"])
         lower_wick = min(last_c["o"], last_c["c"]) - last_c["l"]
 
-        call_score = 1.0
-        put_score = 1.0
+        call_score = 0.0
+        put_score = 0.0
 
+        # 1. Trend & EMA Alignment
         if ema8 > ema21 and ema21 >= ema50:
             call_score += 3.0
         elif ema8 < ema21 and ema21 <= ema50:
@@ -323,50 +299,59 @@ class LiveMarketCandleEngine:
         elif ema8 < ema21:
             put_score += 1.5
 
-        if rsi14 <= 34.0:
+        # 2. RSI Momentum & Reversal Zone
+        if rsi14 <= 32.0:
             call_score += 3.5
-        elif rsi14 >= 66.0:
+        elif rsi14 >= 68.0:
             put_score += 3.5
-        elif rsi14 < 48.0:
-            call_score += 1.0
-        elif rsi14 > 52.0:
-            put_score += 1.0
+        elif rsi14 < 45.0:
+            call_score += 1.2
+        elif rsi14 > 55.0:
+            put_score += 1.2
 
-        if range_pos <= 0.25:
+        # 3. Support / Resistance Range Position
+        if range_pos <= 0.22:
             call_score += 2.5
-        elif range_pos >= 0.75:
+        elif range_pos >= 0.78:
             put_score += 2.5
 
-        if lower_wick > upper_wick * 1.5 and (lower_wick / c_range) >= 0.30:
+        # 4. Candle Wick & Body Structure
+        if lower_wick > upper_wick * 1.6 and (lower_wick / c_range) >= 0.32:
             call_score += 2.5
-        if upper_wick > lower_wick * 1.5 and (upper_wick / c_range) >= 0.30:
+        if upper_wick > lower_wick * 1.6 and (upper_wick / c_range) >= 0.32:
             put_score += 2.5
 
-        if delta > 0 and prev_delta > 0 and abs(delta) < abs(prev_delta) * 0.65:
+        if last_c["c"] > last_c["o"] and (body_size / c_range) >= 0.50:
+            call_score += 1.5
+        elif last_c["c"] < last_c["o"] and (body_size / c_range) >= 0.50:
+            put_score += 1.5
+
+        # 5. Live Price Delta & Exhaustion Check
+        if delta > 0 and prev_delta > 0 and abs(delta) < abs(prev_delta) * 0.55:
             put_score += 3.0
-        elif delta < 0 and prev_delta < 0 and abs(delta) < abs(prev_delta) * 0.65:
+        elif delta < 0 and prev_delta < 0 and abs(delta) < abs(prev_delta) * 0.55:
             call_score += 3.0
         elif delta > 0:
-            call_score += 2.5
+            call_score += 2.2
         elif delta < 0:
-            put_score += 2.5
+            put_score += 2.2
 
-        is_strong_setup = (
-            abs(call_score - put_score) >= 2.2
-            or rsi14 <= 32.0
-            or rsi14 >= 68.0
-            or range_pos <= 0.20
-            or range_pos >= 0.80
+        is_strong_confluence = (
+            abs(call_score - put_score) >= 2.6
+            or rsi14 <= 30.0
+            or rsi14 >= 70.0
+            or range_pos <= 0.18
+            or range_pos >= 0.82
         )
 
-        sig = LiveMarketCandleEngine._apply_strict_anti_bias_guard(call_score, put_score, delta, is_strong_setup)
+        sig = LiveMarketCandleEngine._validate_authentic_market_signal(call_score, put_score, delta, is_strong_confluence)
         if not sig:
             return {
                 "signal": "HOLD",
-                "trend": "ANTI-BIAS FILTER",
+                "trend": "MARKET CONDITION GUARD",
                 "status": "LOW_HOLD",
                 "pts": 0,
-                "rule": f"Balanced/chop guard on {formatted_sym}"
+                "rule": f"No clear/non-choppy setup on {formatted_sym}"
             }
 
         pip_factor = 100000.0 if ("JPY" not in symbol and "XAU" not in symbol) else 100.0
@@ -992,7 +977,7 @@ def bot_script():
                     '</div>' +
                     '<div style="background:rgba(2,8,12,0.94);border:1.2px solid #facc15;border-radius:6px;padding:7px 5px;text-align:center;margin-bottom:4px;">' +
                     '  <div style="font-size:6.8px;font-weight:900;color:#fde047;">LIGHT HOLD</div>' +
-                    '  <div style="font-size:5.8px;color:#cbd5e1;margin-top:3px;line-height:1.25;">' + (reasonText || 'Flat tick') + '</div>' +
+                    '  <div style="font-size:5.8px;color:#cbd5e1;margin-top:3px;line-height:1.25;">' + (reasonText || 'Condition guard') + '</div>' +
                     '  <div style="font-size:6.6px;font-weight:900;color:#ffffff;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + liveMarket + '</div>' +
                     '</div>' +
                     '<div style="text-align:center;font-size:6px;font-weight:800;color:#facc15;border-top:1px dashed rgba(250,204,21,0.35);padding-top:3px;">READY NEXT</div>';
